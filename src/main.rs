@@ -70,6 +70,25 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Max devices that may sit in the pending-confirmation queue at once — caps a
+/// spammer's chances of a random fingerprint collision with the operator's code.
+const MAX_PENDING: usize = 5;
+
+/// 32-char alphabet (no ambiguous 0/O/1/I) — also used for the pairing code.
+const FP_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Short device fingerprint shown on BOTH the phone and the operator's confirm
+/// prompt: first 4 bytes of the NodeId, each mapped into the 32-char alphabet
+/// (`& 0x1F`, bias-free since 32 | 256). ~20 bits ≈ 1/1,048,576.
+/// MUST stay byte-identical with the Swift app's derivation.
+fn fingerprint(node_bytes: &[u8]) -> String {
+    node_bytes
+        .iter()
+        .take(4)
+        .map(|b| FP_ALPHABET[(b & 0x1F) as usize] as char)
+        .collect()
+}
+
 const ALPN: &[u8] = b"hermes-bridge/0";
 /// Separate ALPN for image uploads — keeps the transparent proxy untouched.
 const UPLOAD_ALPN: &[u8] = b"hermes-bridge-upload/0";
@@ -159,8 +178,9 @@ async fn main() -> Result<()> {
 struct BridgeState {
     target: String,
     allowed_path: PathBuf,
+    pending_path: PathBuf,
     allowed: Mutex<HashSet<String>>,
-    /// (code, expiry). `None` once consumed or expired.
+    /// (code, expiry). `None` once expired or burned by too many wrong guesses.
     pairing: Mutex<Option<(String, Instant)>>,
     /// Wrong-guess counter for the open window; burns the code at the cap.
     pair_attempts: Mutex<u32>,
@@ -171,6 +191,8 @@ impl BridgeState {
         let dir = home_dir().join(".hermes-bridge");
         ensure_private_dir(&dir);
         let allowed_path = dir.join("allowed");
+        let pending_path = dir.join("pending");
+        let _ = std::fs::remove_file(&pending_path); // stale from a previous run
         let allowed: HashSet<String> = std::fs::read_to_string(&allowed_path)
             .unwrap_or_default()
             .lines()
@@ -181,55 +203,71 @@ impl BridgeState {
         Self {
             target,
             allowed_path,
+            pending_path,
             allowed: Mutex::new(allowed),
             pairing: Mutex::new(None),
             pair_attempts: Mutex::new(0),
         }
     }
 
-    /// Generate a fresh single-use pairing code valid for `PAIRING_WINDOW`.
+    /// Open a fresh pairing window (a code valid for `PAIRING_WINDOW`). Unlike a
+    /// bearer token, the code is NOT consumed on use — multiple devices may PAIR
+    /// during the window; the operator's fingerprint confirmation decides who
+    /// actually gets allow-listed.
     fn open_pairing_window(&self) -> String {
-        const CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no ambiguous chars
         let mut rng = rand::thread_rng();
         let code: String = (0..8)
-            .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
+            .map(|_| FP_ALPHABET[rng.gen_range(0..FP_ALPHABET.len())] as char)
             .collect();
         *self.pairing.lock().unwrap() = Some((code.clone(), Instant::now() + PAIRING_WINDOW));
+        *self.pair_attempts.lock().unwrap() = 0;
         code
     }
 
+    /// Read the allowlist fresh from disk on every check, so an external `approve`
+    /// (which appends a NodeId to the file) takes effect without a restart.
     fn is_allowed(&self, id: &str) -> bool {
-        self.allowed.lock().unwrap().contains(id)
+        std::fs::read_to_string(&self.allowed_path)
+            .unwrap_or_default()
+            .lines()
+            .any(|l| l.trim() == id)
     }
 
-    /// Validate `code` against the open pairing window; on success register
-    /// `id` (single-use: the window is consumed) and persist the allowlist.
-    /// Wrong guesses are counted and the window is burned at `MAX_PAIR_ATTEMPTS`,
-    /// so an attacker who knows the NodeId can't brute-force the code.
-    fn try_pair(&self, id: &str, code: &str) -> bool {
-        {
-            let mut p = self.pairing.lock().unwrap();
-            let valid = matches!(
-                p.as_ref(),
-                Some((c, exp)) if Instant::now() < *exp && ct_eq(c.as_bytes(), code.as_bytes())
-            );
-            if valid {
-                *p = None; // consume — single use
-            } else {
-                // Count the miss; burn the window once guesses hit the cap.
-                let mut n = self.pair_attempts.lock().unwrap();
-                *n += 1;
-                if *n >= MAX_PAIR_ATTEMPTS {
-                    *p = None;
-                }
-                return false;
+    /// Is `code` the open window's code (constant-time, not expired)? Does NOT
+    /// consume it. Wrong guesses are counted and burn the window at the cap.
+    fn code_valid(&self, code: &str) -> bool {
+        let mut p = self.pairing.lock().unwrap();
+        let ok = matches!(
+            p.as_ref(),
+            Some((c, exp)) if Instant::now() < *exp && ct_eq(c.as_bytes(), code.as_bytes())
+        );
+        if !ok {
+            let mut n = self.pair_attempts.lock().unwrap();
+            *n += 1;
+            if *n >= MAX_PAIR_ATTEMPTS {
+                *p = None;
             }
         }
-        let mut a = self.allowed.lock().unwrap();
-        a.insert(id.to_string());
-        let dump = a.iter().cloned().collect::<Vec<_>>().join("\n");
-        write_private_atomic(&self.allowed_path, (dump + "\n").as_bytes());
-        true
+        ok
+    }
+
+    /// Queue a device for operator confirmation: persist `<fp> <nodeid>` to the
+    /// pending file (deduped by NodeId, capped at `MAX_PENDING`). The `approve`
+    /// step reads this to map the typed code back to the right NodeId.
+    fn add_pending(&self, fp: &str, id: &str) {
+        let mut lines: Vec<String> = std::fs::read_to_string(&self.pending_path)
+            .unwrap_or_default()
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        lines.retain(|l| l.split_whitespace().nth(1) != Some(id)); // dedup by NodeId
+        lines.push(format!("{fp} {id}"));
+        let overflow = lines.len().saturating_sub(MAX_PENDING);
+        if overflow > 0 {
+            lines.drain(0..overflow);
+        }
+        write_private_atomic(&self.pending_path, (lines.join("\n") + "\n").as_bytes());
     }
 }
 
@@ -298,24 +336,48 @@ impl ProtocolHandler for Proxy {
                 };
                 let line = String::from_utf8_lossy(&buf);
                 let line = line.trim();
-                let ok = if let Some(code) = line.strip_prefix("PAIR ") {
-                    self.state.is_allowed(&id_hex) || self.state.try_pair(&id_hex, code.trim())
+                // PAIR from a known device → in. PAIR with a valid code from an
+                // unknown device → queue it for operator confirmation (reply
+                // PENDING + its fingerprint); the device is NOT let in until the
+                // operator approves that fingerprint. This is what defeats a
+                // first-scanner: the operator only confirms the code shown on
+                // their own phone, so a stranger's fingerprint never matches.
+                enum Decision { Ok, Pending(String), Reject }
+                let decision = if let Some(code) = line.strip_prefix("PAIR ") {
+                    if self.state.is_allowed(&id_hex) {
+                        Decision::Ok
+                    } else if self.state.code_valid(code.trim()) {
+                        let fp = fingerprint(id.as_bytes());
+                        self.state.add_pending(&fp, &id_hex);
+                        Decision::Pending(fp)
+                    } else {
+                        Decision::Reject
+                    }
                 } else if line == "HELLO" {
-                    self.state.is_allowed(&id_hex)
+                    if self.state.is_allowed(&id_hex) { Decision::Ok } else { Decision::Reject }
                 } else {
-                    false
+                    Decision::Reject
                 };
-                if ok {
-                    let token = fetch_session_token(&self.state.target).await.unwrap_or_default();
-                    let _ = send.write_all(format!("OK {token}\n").as_bytes()).await;
-                    let _ = send.finish();
-                    println!(">> authorized {id}");
-                    true
-                } else {
-                    let _ = send.write_all(b"ERR unauthorized\n").await;
-                    let _ = send.finish();
-                    println!(">> REJECTED {id}");
-                    false
+                match decision {
+                    Decision::Ok => {
+                        let token = fetch_session_token(&self.state.target).await.unwrap_or_default();
+                        let _ = send.write_all(format!("OK {token}\n").as_bytes()).await;
+                        let _ = send.finish();
+                        println!(">> authorized {id}");
+                        true
+                    }
+                    Decision::Pending(fp) => {
+                        let _ = send.write_all(format!("PENDING {fp}\n").as_bytes()).await;
+                        let _ = send.finish();
+                        println!(">> PENDING {id} — confirm code {fp}");
+                        false
+                    }
+                    Decision::Reject => {
+                        let _ = send.write_all(b"ERR unauthorized\n").await;
+                        let _ = send.finish();
+                        println!(">> REJECTED {id}");
+                        false
+                    }
                 }
             }
             _ => false, // accept_bi error or handshake timeout

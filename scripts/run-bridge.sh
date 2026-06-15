@@ -11,6 +11,48 @@ BIN="$ROOT/target/release/hermes-bridge"
 # Keep logs + QR in the owner-only bridge dir, NOT world-readable /tmp.
 BRIDGE_DIR="$HOME/.hermes-bridge"
 mkdir -p "$BRIDGE_DIR"; chmod 700 "$BRIDGE_DIR" 2>/dev/null || true
+
+# Device-management subcommands (1vN allowlist):
+#   approve <code>  — confirm a pending phone by the code shown on its screen
+#   list            — show paired devices (NodeId prefixes)
+#   revoke <id|all> — remove a paired device (by NodeId prefix) or wipe all
+# The bridge wrote `<fingerprint> <NodeId>` lines to pending when a phone PAIRed;
+# `approve` maps the operator-typed code back to its NodeId. This human
+# confirmation defeats a first-scanner — you only type the code on YOUR phone.
+PENDING="$BRIDGE_DIR/pending"; ALLOWED="$BRIDGE_DIR/allowed"
+case "${1:-}" in
+  approve)
+    CODE="$(printf '%s' "${2:-}" | tr -d '[:space:]-' | tr '[:lower:]' '[:upper:]')"
+    [ -n "$CODE" ] || { echo "usage: run-bridge.sh approve <code>"; exit 1; }
+    N="$(awk -v c="$CODE" 'toupper($1)==c' "$PENDING" 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "$N" = "0" ]; then
+      echo "✗ no pending device with code $CODE — has the phone scanned yet? (code may have expired)"; exit 1
+    elif [ "$N" != "1" ]; then
+      echo "✗ $N devices share code $CODE — possible attack. Re-show the QR and re-pair instead of approving."; exit 1
+    fi
+    NODE="$(awk -v c="$CODE" 'toupper($1)==c {print $2; exit}' "$PENDING")"
+    touch "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null
+    grep -qxF "$NODE" "$ALLOWED" 2>/dev/null || echo "$NODE" >> "$ALLOWED"
+    awk -v c="$CODE" 'toupper($1)!=c' "$PENDING" > "$PENDING.tmp" 2>/dev/null && mv "$PENDING.tmp" "$PENDING"
+    echo "✓ approved device (code $CODE) — your phone will connect on its next retry."
+    exit 0 ;;
+  list)
+    if [ ! -s "$ALLOWED" ]; then echo "(no paired devices)"; exit 0; fi
+    echo "paired devices:"; n=0
+    while IFS= read -r id; do [ -n "$id" ] || continue; n=$((n+1)); echo "  $n. ${id:0:16}…"; done < "$ALLOWED"
+    exit 0 ;;
+  revoke)
+    ARG="${2:-}"; [ -n "$ARG" ] || { echo "usage: run-bridge.sh revoke <nodeid-prefix|all>"; exit 1; }
+    if [ "$ARG" = "all" ]; then : > "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null; echo "✓ revoked all devices."; exit 0; fi
+    if grep -q "^$ARG" "$ALLOWED" 2>/dev/null; then
+      grep -v "^$ARG" "$ALLOWED" > "$ALLOWED.tmp" && mv "$ALLOWED.tmp" "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null
+      echo "✓ revoked device(s) matching $ARG."
+    else
+      echo "✗ no device matching $ARG (use 'list' to see prefixes)."
+    fi
+    exit 0 ;;
+esac
+
 LOG="$BRIDGE_DIR/bridge.log"; : > "$LOG"; chmod 600 "$LOG" 2>/dev/null
 QR_PNG="$BRIDGE_DIR/qr.png"
 
