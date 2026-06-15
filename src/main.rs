@@ -269,6 +269,19 @@ impl BridgeState {
         }
         write_private_atomic(&self.pending_path, (lines.join("\n") + "\n").as_bytes());
     }
+
+    /// Remove `id` from the allowlist. iroh authenticates the NodeId, so a device
+    /// can only ever revoke ITSELF (UNPAIR) — no code needed.
+    fn revoke(&self, id: &str) {
+        let kept: Vec<String> = std::fs::read_to_string(&self.allowed_path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && *l != id)
+            .map(String::from)
+            .collect();
+        write_private_atomic(&self.allowed_path, (kept.join("\n") + "\n").as_bytes());
+    }
 }
 
 /// Persist `data` to `path` atomically (temp file + rename) with 0600 perms, so
@@ -342,8 +355,12 @@ impl ProtocolHandler for Proxy {
                 // operator approves that fingerprint. This is what defeats a
                 // first-scanner: the operator only confirms the code shown on
                 // their own phone, so a stranger's fingerprint never matches.
-                enum Decision { Ok, Pending(String), Reject }
-                let decision = if let Some(code) = line.strip_prefix("PAIR ") {
+                enum Decision { Ok, Pending(String), Unpaired, Reject }
+                let decision = if line == "UNPAIR" {
+                    // A device removing itself from the allowlist (self-revoke).
+                    self.state.revoke(&id_hex);
+                    Decision::Unpaired
+                } else if let Some(code) = line.strip_prefix("PAIR ") {
                     if self.state.is_allowed(&id_hex) {
                         Decision::Ok
                     } else if self.state.code_valid(code.trim()) {
@@ -370,6 +387,12 @@ impl ProtocolHandler for Proxy {
                         let _ = send.write_all(format!("PENDING {fp}\n").as_bytes()).await;
                         let _ = send.finish();
                         println!(">> PENDING {id} — confirm code {fp}");
+                        false
+                    }
+                    Decision::Unpaired => {
+                        let _ = send.write_all(b"OK unpaired\n").await;
+                        let _ = send.finish();
+                        println!(">> UNPAIRED {id}");
                         false
                     }
                     Decision::Reject => {
