@@ -1,0 +1,14 @@
+[package]
+name = "hermes-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iroh = "=1.0.0-rc.1"
+iroh-tickets = "=1.0.0-rc.1"
+n0-error = { version = "=1.0.0-rc.0", features = ["anyhow"] }
+tokio = { version = "1.44.1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+qrcode = "0.14"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rand = "0.8"
