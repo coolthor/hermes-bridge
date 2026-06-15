@@ -45,7 +45,10 @@ case "${1:-}" in
     ARG="${2:-}"; [ -n "$ARG" ] || { echo "usage: run-bridge.sh revoke <nodeid-prefix|all>"; exit 1; }
     if [ "$ARG" = "all" ]; then : > "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null; echo "✓ revoked all devices."; exit 0; fi
     if grep -q "^$ARG" "$ALLOWED" 2>/dev/null; then
-      grep -v "^$ARG" "$ALLOWED" > "$ALLOWED.tmp" && mv "$ALLOWED.tmp" "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null
+      # NB: grep -v exits non-zero when it removes the LAST line (no output left),
+      # so don't gate the mv on its exit code or the file won't update.
+      grep -v "^$ARG" "$ALLOWED" > "$ALLOWED.tmp" 2>/dev/null || true
+      mv "$ALLOWED.tmp" "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null
       echo "✓ revoked device(s) matching $ARG."
     else
       echo "✗ no device matching $ARG (use 'list' to see prefixes)."
