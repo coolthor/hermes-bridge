@@ -10,6 +10,10 @@
 #   bash ~/hermes-bridge/install.sh
 set -uo pipefail
 
+# An agent's shell is often non-login with a minimal PATH that omits Homebrew /
+# rustup. Make an already-installed cargo findable before we decide we need one.
+export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 SKILLS_DIR="$HERMES_HOME/skills"
