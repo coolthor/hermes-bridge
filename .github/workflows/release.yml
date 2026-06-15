@@ -1,0 +1,33 @@
+name: release
+
+# Push a tag like v0.1.0 → build the bridge for every platform and attach the
+# binaries to the GitHub Release, so install.sh can download instead of compile.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14,        asset: hermes-bridge-darwin-arm64 }
+          - { runner: macos-13,        asset: hermes-bridge-darwin-x86_64 }
+          - { runner: ubuntu-latest,   asset: hermes-bridge-linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, asset: hermes-bridge-linux-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --release --bin hermes-bridge
+      - name: Stage asset
+        run: cp target/release/hermes-bridge "${{ matrix.asset }}"
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

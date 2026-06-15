@@ -22,14 +22,48 @@ echo "→ Hermes phone bridge installer"
 echo "  repo:       $ROOT"
 echo "  skills dir: $SKILLS_DIR"
 
-# 1. Build the bridge (needs the Rust toolchain).
-if [ ! -x "$ROOT/target/release/hermes-bridge" ]; then
-  if ! command -v cargo >/dev/null 2>&1; then
-    echo "✗ Rust toolchain not found. Install it from https://rustup.rs then re-run."
+# 1. Get the bridge binary: prefer a prebuilt release asset (no Rust needed),
+#    fall back to building from source.
+BIN="$ROOT/target/release/hermes-bridge"
+
+os_tag() { case "$(uname -s)" in Darwin) echo darwin;; Linux) echo linux;; *) echo unknown;; esac; }
+arch_tag() { case "$(uname -m)" in arm64|aarch64) echo arm64;; x86_64|amd64) echo x86_64;; *) echo unknown;; esac; }
+
+repo_slug() {
+  git -C "$ROOT" remote get-url origin 2>/dev/null \
+    | sed -E 's#.*github\.com[:/]##; s#\.git$##' \
+    | grep -E '^[^/]+/[^/]+$' || echo "coolthor/hermes-bridge"
+}
+
+download_prebuilt() {
+  local asset="hermes-bridge-$(os_tag)-$(arch_tag)"
+  local slug; slug="$(repo_slug)"
+  [ "$asset" = "hermes-bridge-unknown-unknown" ] && return 1
+  mkdir -p "$(dirname "$BIN")"
+  echo "→ fetching prebuilt $asset from $slug…"
+  # gh works for private + public repos; plain curl is the no-gh public path.
+  if command -v gh >/dev/null 2>&1 \
+     && gh release download --repo "$slug" --pattern "$asset" --output "$BIN" --clobber 2>/dev/null; then
+    chmod +x "$BIN"; return 0
+  fi
+  if curl -fsSL "https://github.com/$slug/releases/latest/download/$asset" -o "$BIN" 2>/dev/null \
+     && [ -s "$BIN" ]; then
+    chmod +x "$BIN"; return 0
+  fi
+  rm -f "$BIN"; return 1
+}
+
+if [ ! -x "$BIN" ]; then
+  if download_prebuilt; then
+    echo "✓ installed prebuilt binary (no build needed)"
+  elif command -v cargo >/dev/null 2>&1; then
+    echo "→ no prebuilt for this platform — building from source (first build takes a few minutes)…"
+    ( cd "$ROOT" && cargo build --release ) || { echo "✗ build failed"; exit 1; }
+  else
+    echo "✗ No prebuilt binary for this platform and no Rust toolchain to build one."
+    echo "  Install Rust from https://rustup.rs and re-run, or open an issue for a prebuilt."
     exit 1
   fi
-  echo "→ building hermes-bridge (first build can take a few minutes)…"
-  ( cd "$ROOT" && cargo build --release ) || { echo "✗ build failed"; exit 1; }
 fi
 echo "✓ bridge binary ready"
 
