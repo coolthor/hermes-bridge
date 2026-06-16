@@ -133,8 +133,14 @@ else
 fi
 
 # Supervisor (forked to background): follow the dashboard port across Hermes
-# Desktop restarts, so the script still returns the QR for the agent flow.
-pkill -f 'hermes-bridge-supervisor' 2>/dev/null || true
+# Desktop restarts. Start it ONLY if one isn't already running — the agent's
+# sandbox can block `pkill`, so we must NOT rely on killing old ones; instead
+# never spawn a duplicate. Duplicates pile up and fight over the bridge, churning
+# the pairing code (every restart = new code → the scanned QR goes stale →
+# "ERR unauthorized"). A single long-lived supervisor adapts to port changes itself.
+if pgrep -f 'hermes-bridge-supervisor' >/dev/null 2>&1; then
+  echo "→ supervisor already running (reused — not spawning a duplicate)"
+else
 (
   exec -a hermes-bridge-supervisor bash -c '
     PORT="'"$PORT"'"; ROOT="'"$ROOT"'"; BIN="'"$BIN"'"; LOG="'"$LOG"'"
@@ -155,3 +161,4 @@ pkill -f 'hermes-bridge-supervisor' 2>/dev/null || true
 ) >/dev/null 2>&1 &
 disown 2>/dev/null || true
 echo "→ supervisor running (auto-follows dashboard port)"
+fi
