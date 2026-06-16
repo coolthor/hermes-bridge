@@ -406,6 +406,12 @@ impl ProtocolHandler for Proxy {
             _ => false, // accept_bi error or handshake timeout
         };
         if !authorized {
+            // Grace before dropping: dropping the Connection sends ApplicationClose,
+            // which races the peer's read of the OK/PENDING/ERR/unpaired reply →
+            // ConnectionLost on the app (it never sees the PENDING code). finish()
+            // doesn't guarantee delivery before the drop, so wait for the peer to
+            // close (bounded) — by then it has read the reply.
+            let _ = timeout(Duration::from_secs(8), connection.closed()).await;
             return Ok(());
         }
 
