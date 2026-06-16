@@ -60,7 +60,7 @@ case "${1:-}" in
   list)
     if [ ! -s "$ALLOWED" ]; then echo "(no paired devices)"; exit 0; fi
     echo "paired devices:"; n=0
-    while IFS= read -r id; do [ -n "$id" ] || continue; n=$((n+1)); echo "  $n. ${id:0:16}…"; done < "$ALLOWED"
+    while IFS= read -r id; do [ -n "$id" ] || continue; n=$((n+1)); echo "  $n. ${id:0:16}..."; done < "$ALLOWED"
     exit 0 ;;
   revoke)
     ARG="${2:-}"; [ -n "$ARG" ] || { echo "usage: run-bridge.sh revoke <nodeid-prefix|all>"; exit 1; }
@@ -96,7 +96,7 @@ open_qr() {
 }
 
 if [ ! -x "$BIN" ]; then
-  echo "building hermes-bridge…"
+  echo "building hermes-bridge..."
   ( cd "$ROOT" && cargo build --release )
 fi
 
@@ -144,7 +144,7 @@ PORT="$(current_port)" || {
   exit 1
 }
 TOKEN="$(current_token)"
-echo "→ dashboard at 127.0.0.1:$PORT  (token ${TOKEN:0:6}…)"
+echo "→ dashboard at 127.0.0.1:$PORT  (token ${TOKEN:0:6}...)"
 start_bridge "$PORT" "$TOKEN"
 
 # Wait for the bridge to come up (readiness marker carries NO secret — the

@@ -40,7 +40,7 @@ download_prebuilt() {
   local slug; slug="$(repo_slug)"
   [ "$asset" = "hermes-bridge-unknown-unknown" ] && return 1
   mkdir -p "$(dirname "$BIN")"
-  echo "→ fetching prebuilt $asset from $slug…"
+  echo "→ fetching prebuilt $asset from $slug..."
   # gh works for private + public repos; plain curl is the no-gh public path.
   if command -v gh >/dev/null 2>&1 \
      && gh release download --repo "$slug" --pattern "$asset" --output "$BIN" --clobber 2>/dev/null; then
@@ -57,7 +57,7 @@ if [ ! -x "$BIN" ]; then
   if download_prebuilt; then
     echo "✓ installed prebuilt binary (no build needed)"
   elif command -v cargo >/dev/null 2>&1; then
-    echo "→ no prebuilt for this platform — building from source (first build takes a few minutes)…"
+    echo "→ no prebuilt for this platform — building from source (first build takes a few minutes)..."
     ( cd "$ROOT" && cargo build --release ) || { echo "✗ build failed"; exit 1; }
   else
     echo "✗ No prebuilt binary for this platform and no Rust toolchain to build one."
@@ -73,7 +73,7 @@ ln -sfn "$ROOT/skills/connect-phone" "$SKILLS_DIR/connect-phone"
 echo "✓ skill installed → $SKILLS_DIR/connect-phone"
 
 # 3. Show the pairing QR now, so the very first run is end-to-end.
-echo "→ starting bridge + showing pairing QR…"
+echo "→ starting bridge + showing pairing QR..."
 "$ROOT/scripts/run-bridge.sh" --open || true
 
 cat <<'EOF'
