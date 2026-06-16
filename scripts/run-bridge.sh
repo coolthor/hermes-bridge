@@ -97,6 +97,11 @@ current_port() {
 }
 
 current_token() {
+  # Prefer our own inherited env: when the AGENT (running inside the dashboard
+  # process) invokes this skill, the token is already in the environment — no
+  # cross-process read needed (the agent's shell sandbox may block `ps eww` from
+  # reading another process's env, which silently yields an empty token).
+  [ -n "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ] && { printf '%s' "$HERMES_DASHBOARD_SESSION_TOKEN"; return 0; }
   local dpid; dpid="$(dashboard_pid)"; [ -n "$dpid" ] || return 1
   ps eww "$dpid" 2>/dev/null | tr ' ' '\n' | grep '^HERMES_DASHBOARD_SESSION_TOKEN=' | cut -d= -f2
 }
@@ -135,7 +140,7 @@ pkill -f 'hermes-bridge-supervisor' 2>/dev/null || true
     PORT="'"$PORT"'"; ROOT="'"$ROOT"'"; BIN="'"$BIN"'"; LOG="'"$LOG"'"
     dashboard_pid() { local p; for p in $(pgrep -f "hermes_cli.main dashboard"); do ps -o command= -p "$p" 2>/dev/null | grep -q "hermes-bridge-supervisor" && continue; echo "$p"; return 0; done; return 1; }
     current_port() { local d p; d="$(dashboard_pid)"; [ -n "$d" ] || return 1; for p in $(lsof -nP -p "$d" -iTCP -sTCP:LISTEN 2>/dev/null | grep -oE "127\.0\.0\.1:[0-9]+" | cut -d: -f2 | sort -u); do curl -s -m2 "http://127.0.0.1:$p/api/status" 2>/dev/null | grep -q "\"version\"" && { echo "$p"; return 0; }; done; return 1; }
-    current_token() { local d; d="$(dashboard_pid)"; ps eww "$d" 2>/dev/null | tr " " "\n" | grep "^HERMES_DASHBOARD_SESSION_TOKEN=" | cut -d= -f2; }
+    current_token() { [ -n "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ] && { printf "%s" "$HERMES_DASHBOARD_SESSION_TOKEN"; return 0; }; local d; d="$(dashboard_pid)"; ps eww "$d" 2>/dev/null | tr " " "\n" | grep "^HERMES_DASHBOARD_SESSION_TOKEN=" | cut -d= -f2; }
     while true; do
       sleep 15
       np="$(current_port)" || continue
