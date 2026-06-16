@@ -20,20 +20,41 @@ mkdir -p "$BRIDGE_DIR"; chmod 700 "$BRIDGE_DIR" 2>/dev/null || true
 # `approve` maps the operator-typed code back to its NodeId. This human
 # confirmation defeats a first-scanner — you only type the code on YOUR phone.
 PENDING="$BRIDGE_DIR/pending"; ALLOWED="$BRIDGE_DIR/allowed"
+
+# Cross-process lock — same mkdir-mutex on <file>.lock that the Rust bridge uses
+# (FileLock), so a concurrent PAIR (Rust add_pending) and an approve/revoke can't
+# clobber each other's read-modify-write. Portable (macOS has no flock(1)); steals
+# a stale lock after 5s in case a holder crashed.
+_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+lock_acquire() {
+  local d="$1.lock" i=0
+  while ! mkdir "$d" 2>/dev/null; do
+    [ "$(( $(date +%s) - $(_mtime "$d") ))" -gt 5 ] && { rmdir "$d" 2>/dev/null; continue; }
+    i=$((i+1)); [ "$i" -gt 200 ] && break; sleep 0.01
+  done
+}
+lock_release() { rmdir "$1.lock" 2>/dev/null || true; }
+
 case "${1:-}" in
   approve)
     CODE="$(printf '%s' "${2:-}" | tr -d '[:space:]-' | tr '[:lower:]' '[:upper:]')"
     [ -n "$CODE" ] || { echo "usage: run-bridge.sh approve <code>"; exit 1; }
+    lock_acquire "$PENDING"
     N="$(awk -v c="$CODE" 'toupper($1)==c' "$PENDING" 2>/dev/null | wc -l | tr -d ' ')"
     if [ "$N" = "0" ]; then
+      lock_release "$PENDING"
       echo "✗ no pending device with code $CODE — has the phone scanned yet? (code may have expired)"; exit 1
     elif [ "$N" != "1" ]; then
+      lock_release "$PENDING"
       echo "✗ $N devices share code $CODE — possible attack. Re-show the QR and re-pair instead of approving."; exit 1
     fi
     NODE="$(awk -v c="$CODE" 'toupper($1)==c {print $2; exit}' "$PENDING")"
+    lock_acquire "$ALLOWED"
     touch "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null
     grep -qxF "$NODE" "$ALLOWED" 2>/dev/null || echo "$NODE" >> "$ALLOWED"
+    lock_release "$ALLOWED"
     awk -v c="$CODE" 'toupper($1)!=c' "$PENDING" > "$PENDING.tmp" 2>/dev/null && mv "$PENDING.tmp" "$PENDING"
+    lock_release "$PENDING"
     echo "✓ approved device (code $CODE) — your phone will connect on its next retry."
     exit 0 ;;
   list)
@@ -43,14 +64,19 @@ case "${1:-}" in
     exit 0 ;;
   revoke)
     ARG="${2:-}"; [ -n "$ARG" ] || { echo "usage: run-bridge.sh revoke <nodeid-prefix|all>"; exit 1; }
-    if [ "$ARG" = "all" ]; then : > "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null; echo "✓ revoked all devices."; exit 0; fi
-    if grep -q "^$ARG" "$ALLOWED" 2>/dev/null; then
-      # NB: grep -v exits non-zero when it removes the LAST line (no output left),
-      # so don't gate the mv on its exit code or the file won't update.
-      grep -v "^$ARG" "$ALLOWED" > "$ALLOWED.tmp" 2>/dev/null || true
+    lock_acquire "$ALLOWED"
+    if [ "$ARG" = "all" ]; then
+      : > "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null; lock_release "$ALLOWED"
+      echo "✓ revoked all devices."; exit 0
+    fi
+    # Fixed-string PREFIX match (index==1), NOT regex — so '.' etc. can't over-match.
+    if awk -v a="$ARG" 'index($0,a)==1{f=1} END{exit !f}' "$ALLOWED" 2>/dev/null; then
+      awk -v a="$ARG" 'index($0,a)!=1' "$ALLOWED" > "$ALLOWED.tmp" 2>/dev/null || true
       mv "$ALLOWED.tmp" "$ALLOWED"; chmod 600 "$ALLOWED" 2>/dev/null
+      lock_release "$ALLOWED"
       echo "✓ revoked device(s) matching $ARG."
     else
+      lock_release "$ALLOWED"
       echo "✗ no device matching $ARG (use 'list' to see prefixes)."
     fi
     exit 0 ;;
@@ -138,6 +164,9 @@ fi
 # never spawn a duplicate. Duplicates pile up and fight over the bridge, churning
 # the pairing code (every restart = new code → the scanned QR goes stale →
 # "ERR unauthorized"). A single long-lived supervisor adapts to port changes itself.
+# Serialise the check-and-spawn so two concurrent run-bridge invocations can't
+# both see "no supervisor" and each spawn one (the TOCTOU both reviewers flagged).
+lock_acquire "$BRIDGE_DIR/supervisor"
 if pgrep -f 'hermes-bridge-supervisor' >/dev/null 2>&1; then
   echo "→ supervisor already running (reused — not spawning a duplicate)"
 else
@@ -162,3 +191,4 @@ else
 disown 2>/dev/null || true
 echo "→ supervisor running (auto-follows dashboard port)"
 fi
+lock_release "$BRIDGE_DIR/supervisor"

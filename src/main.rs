@@ -29,8 +29,12 @@ use n0_error::{Result, StdResultExt};
 use qrcode::{QrCode, render::unicode};
 use rand::Rng;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
+/// Cap on concurrent inbound connections (across proxy + upload) — bounds fd /
+/// memory so a peer can't exhaust the host by opening thousands at once.
+const MAX_CONNS: usize = 64;
 /// Max wrong pairing-code guesses before the open window is burned.
 const MAX_PAIR_ATTEMPTS: u32 = 8;
 /// Bound the control handshake / upload reads so a peer can't hold a stream open.
@@ -184,6 +188,8 @@ struct BridgeState {
     pairing: Mutex<Option<(String, Instant)>>,
     /// Wrong-guess counter for the open window; burns the code at the cap.
     pair_attempts: Mutex<u32>,
+    /// Caps concurrent inbound connections (anti-exhaustion).
+    conn_sem: Arc<Semaphore>,
 }
 
 impl BridgeState {
@@ -207,6 +213,7 @@ impl BridgeState {
             allowed: Mutex::new(allowed),
             pairing: Mutex::new(None),
             pair_attempts: Mutex::new(0),
+            conn_sem: Arc::new(Semaphore::new(MAX_CONNS)),
         }
     }
 
@@ -252,27 +259,32 @@ impl BridgeState {
     }
 
     /// Queue a device for operator confirmation: persist `<fp> <nodeid>` to the
-    /// pending file (deduped by NodeId, capped at `MAX_PENDING`). The `approve`
-    /// step reads this to map the typed code back to the right NodeId.
-    fn add_pending(&self, fp: &str, id: &str) {
+    /// pending file (deduped by NodeId). Returns false (adding nothing) when the
+    /// queue is already full of OTHER devices — so a QR-holding attacker can't
+    /// evict the legitimate device's pending row by flooding fresh NodeIds. An
+    /// already-queued device can always re-register (the app re-PAIRs each poll).
+    fn add_pending(&self, fp: &str, id: &str) -> bool {
+        let _lock = FileLock::acquire(&self.pending_path);
         let mut lines: Vec<String> = std::fs::read_to_string(&self.pending_path)
             .unwrap_or_default()
             .lines()
             .map(|s| s.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
+        let already = lines.iter().any(|l| l.split_whitespace().nth(1) == Some(id));
+        if !already && lines.len() >= MAX_PENDING {
+            return false; // full of other devices — reject rather than evict
+        }
         lines.retain(|l| l.split_whitespace().nth(1) != Some(id)); // dedup by NodeId
         lines.push(format!("{fp} {id}"));
-        let overflow = lines.len().saturating_sub(MAX_PENDING);
-        if overflow > 0 {
-            lines.drain(0..overflow);
-        }
         write_private_atomic(&self.pending_path, (lines.join("\n") + "\n").as_bytes());
+        true
     }
 
     /// Remove `id` from the allowlist. iroh authenticates the NodeId, so a device
     /// can only ever revoke ITSELF (UNPAIR) — no code needed.
     fn revoke(&self, id: &str) {
+        let _lock = FileLock::acquire(&self.allowed_path);
         let kept: Vec<String> = std::fs::read_to_string(&self.allowed_path)
             .unwrap_or_default()
             .lines()
@@ -291,6 +303,44 @@ fn write_private_atomic(path: &Path, data: &[u8]) {
     if std::fs::write(&tmp, data).is_ok() {
         restrict_file(&tmp);
         let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Cross-process advisory lock via atomic `mkdir` — portable (no flock dep, works
+/// on macOS which lacks flock(1)) and shared with the shell side, which locks the
+/// same `<file>.lock` dir. Serialises read-modify-write on pending/allowed so a
+/// concurrent PAIR and approve/revoke can't lose each other's update. RAII: the
+/// lock dir is removed on drop. Best-effort: spins ~2s, steals a stale lock.
+struct FileLock {
+    dir: PathBuf,
+    held: bool,
+}
+impl FileLock {
+    fn acquire(target: &Path) -> Self {
+        let dir = target.with_extension("lock");
+        let mut held = false;
+        for _ in 0..200 {
+            if std::fs::create_dir(&dir).is_ok() {
+                held = true;
+                break;
+            }
+            // Steal a stale lock (holder crashed mid-update).
+            if let Ok(modified) = std::fs::metadata(&dir).and_then(|m| m.modified()) {
+                if modified.elapsed().map(|a| a > Duration::from_secs(5)).unwrap_or(false) {
+                    let _ = std::fs::remove_dir(&dir);
+                    continue;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        FileLock { dir, held }
+    }
+}
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = std::fs::remove_dir(&self.dir);
+        }
     }
 }
 
@@ -332,6 +382,11 @@ impl std::fmt::Debug for Proxy {
 
 impl ProtocolHandler for Proxy {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        // Shed load past the connection cap so a peer can't exhaust fd/memory.
+        let _permit = match self.state.conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
         let id = connection.remote_id();
         let id_hex = id.to_string();
 
@@ -365,8 +420,11 @@ impl ProtocolHandler for Proxy {
                         Decision::Ok
                     } else if self.state.code_valid(code.trim()) {
                         let fp = fingerprint(id.as_bytes());
-                        self.state.add_pending(&fp, &id_hex);
-                        Decision::Pending(fp)
+                        if self.state.add_pending(&fp, &id_hex) {
+                            Decision::Pending(fp)
+                        } else {
+                            Decision::Reject // pending queue full of other devices
+                        }
                     } else {
                         Decision::Reject
                     }
@@ -411,7 +469,7 @@ impl ProtocolHandler for Proxy {
             // ConnectionLost on the app (it never sees the PENDING code). finish()
             // doesn't guarantee delivery before the drop, so wait for the peer to
             // close (bounded) — by then it has read the reply.
-            let _ = timeout(Duration::from_secs(8), connection.closed()).await;
+            let _ = timeout(Duration::from_secs(3), connection.closed()).await;
             return Ok(());
         }
 
@@ -472,6 +530,10 @@ impl std::fmt::Debug for Upload {
 
 impl ProtocolHandler for Upload {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let _permit = match self.state.conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
         let id = connection.remote_id().to_string();
         if !self.state.is_allowed(&id) {
             return Ok(()); // only paired devices may upload
