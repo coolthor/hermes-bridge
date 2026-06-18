@@ -96,6 +96,25 @@ fn fingerprint(node_bytes: &[u8]) -> String {
 const ALPN: &[u8] = b"hermes-bridge/0";
 /// Separate ALPN for image uploads — keeps the transparent proxy untouched.
 const UPLOAD_ALPN: &[u8] = b"hermes-bridge-upload/0";
+/// Separate ALPN for media DOWNLOAD (agent → phone): the phone requests a file
+/// the agent placed in the outbox, so generated images/audio/video reach the app.
+const DOWNLOAD_ALPN: &[u8] = b"hermes-bridge-download/0";
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard cap on a single served media file (videos can be largish).
+const MAX_MEDIA_BYTES: usize = 100 * 1024 * 1024;
+/// File extensions the download channel will serve (by basename) — media plus
+/// common documents/archives. A paired device already controls the dashboard,
+/// so this is about avoiding accidental odd reads, not a trust boundary.
+const MEDIA_EXTS: &[&str] = &[
+    // images / video / audio
+    "png", "jpg", "jpeg", "gif", "webp", "heic", "bmp", "tiff", "svg",
+    "mp4", "mov", "m4v", "webm", "mkv", "m4a", "wav", "mp3", "aac", "flac", "ogg",
+    // documents / data
+    "pdf", "txt", "md", "rtf", "csv", "tsv", "json", "yaml", "yml", "log",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "epub",
+    // code / archives
+    "zip", "tar", "gz", "tgz", "7z", "html", "htm", "py", "js", "ts", "rs", "swift",
+];
 const DEFAULT_TARGET: &str = "127.0.0.1:9119";
 /// QR payload scheme: `hb1|<ticket>|<pairing_code>`.
 const QR_SCHEME: &str = "hb1";
@@ -167,7 +186,8 @@ async fn main() -> Result<()> {
 
     let router = Router::builder(endpoint)
         .accept(ALPN, Proxy { state: state.clone() })
-        .accept(UPLOAD_ALPN, Upload { state })
+        .accept(UPLOAD_ALPN, Upload { state: state.clone() })
+        .accept(DOWNLOAD_ALPN, Download { state })
         .spawn();
 
     println!("bridging... (Ctrl-C to quit)\n");
@@ -560,6 +580,96 @@ impl ProtocolHandler for Upload {
         }
         Ok(())
     }
+}
+
+/// Media download protocol (agent → phone). Only paired NodeIds may download,
+/// and ONLY from the outbox dir `$HERMES_HOME/media-out/` by basename — so a
+/// paired device can fetch files the agent explicitly placed there, never an
+/// arbitrary path on the host. Stream: `DOWNLOAD <name>\n` → `OK <len>\n<bytes>`.
+#[derive(Clone)]
+struct Download {
+    state: Arc<BridgeState>,
+}
+
+impl std::fmt::Debug for Download {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Download")
+    }
+}
+
+impl ProtocolHandler for Download {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let _permit = match self.state.conn_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let id = connection.remote_id().to_string();
+        if !self.state.is_allowed(&id) {
+            return Ok(()); // only paired devices may download
+        }
+        loop {
+            match connection.accept_bi().await {
+                Ok((mut send, mut recv)) => {
+                    let req = match timeout(DOWNLOAD_TIMEOUT, recv.read_to_end(4096)).await {
+                        Ok(Ok(b)) => b,
+                        _ => Vec::new(),
+                    };
+                    match read_outbox_file(&req) {
+                        Some(bytes) => {
+                            println!(">> served media ({} bytes)", bytes.len());
+                            let header = format!("OK {}\n", bytes.len());
+                            let _ = send.write_all(header.as_bytes()).await;
+                            let _ = send.write_all(&bytes).await;
+                        }
+                        None => {
+                            let _ = send.write_all(b"ERR not found\n").await;
+                        }
+                    }
+                    let _ = send.finish();
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolve a `DOWNLOAD <name>\n` request to bytes, safely. `name` is sanitized to
+/// a bare filename (no path separators, no `..`) with a media extension, and only
+/// looked up by basename in the agent's media dirs — the bridge outbox and /tmp
+/// (where gen skills write). A paired device already controls the whole dashboard,
+/// so serving its media outputs adds no meaningful access.
+fn read_outbox_file(req: &[u8]) -> Option<Vec<u8>> {
+    let nl = req.iter().position(|&b| b == b'\n').unwrap_or(req.len());
+    let header = std::str::from_utf8(&req[..nl]).ok()?;
+    let name = header.strip_prefix("DOWNLOAD ")?.trim();
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .collect();
+    if safe.is_empty() || safe.contains("..") {
+        return None;
+    }
+    let ext_ok = safe
+        .rsplit('.')
+        .next()
+        .map(|e| MEDIA_EXTS.contains(&e.to_lowercase().as_str()))
+        .unwrap_or(false);
+    if !ext_ok {
+        return None;
+    }
+    let home = std::env::var("HERMES_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home_dir().join(".hermes"));
+    // media-out first (explicitly staged), then /tmp (raw gen output).
+    for dir in [home.join("media-out"), PathBuf::from("/tmp")] {
+        if let Ok(bytes) = std::fs::read(dir.join(&safe)) {
+            if !bytes.is_empty() && bytes.len() <= MAX_MEDIA_BYTES {
+                return Some(bytes);
+            }
+        }
+    }
+    None
 }
 
 fn parse_and_save_upload(data: &[u8]) -> Option<String> {

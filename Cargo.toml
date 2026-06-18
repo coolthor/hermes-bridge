@@ -2,6 +2,12 @@
 name = "hermes-bridge"
 version = "0.1.0"
 edition = "2021"
+description = "Encrypted peer-to-peer bridge connecting the HermesApp iOS client to a self-hosted Hermes agent over iroh. Zero-operator: no servers, no middleman."
+license = "MIT"
+repository = "https://github.com/coolthor/hermes-bridge"
+readme = "README.en.md"
+keywords = ["iroh", "p2p", "hermes", "ai-agent", "bridge"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 iroh = "=1.0.0-rc.1"
