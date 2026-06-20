@@ -30,7 +30,7 @@
 ## Prerequisites
 
 - **Hermes** running on this machine — Hermes Desktop, or the headless `hermes dashboard` CLI.
-- **Muninn** on your phone (TestFlight / App Store).
+- **Muninn** on your phone — [**TestFlight public beta link**](https://testflight.apple.com/join/8mcRtXsm) (tap to install, no sign-up).
 - **No Rust needed** — the installer downloads the prebuilt binary for your platform (and only builds from source if none is available).
 
 ## Install — one line to your Hermes

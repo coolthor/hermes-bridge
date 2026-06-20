@@ -30,7 +30,7 @@
 ## 需求
 
 - 本機跑著 **Hermes** —— Hermes Desktop,或無頭的 `hermes dashboard` CLI 都行。
-- 手機裝 **Muninn**(TestFlight / App Store)。
+- 手機裝 **Muninn** —— [**TestFlight 公開測試連結**](https://testflight.apple.com/join/8mcRtXsm)(點開直接安裝,免申請)。
 - **不需要先裝 Rust** —— installer 會自動下載你平台對應的編好 binary(沒有的話才退而本機編)。
 
 ## 安裝 —— 一句話丟給你的 Hermes
