@@ -130,6 +130,23 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Singleton guard — acquire BEFORE binding the iroh endpoint so a second
+    // bridge never registers the same NodeId on the relay. The flock is held for
+    // the whole run and auto-released by the kernel on exit/crash.
+    let bridge_dir = home_dir().join(".hermes-bridge");
+    ensure_private_dir(&bridge_dir);
+    let _singleton = match SingletonLock::acquire(&bridge_dir.join("bridge.lock")) {
+        Some(lock) => lock,
+        None => {
+            eprintln!(
+                "hermes-bridge: another instance already holds {}/bridge.lock — \
+                 exiting to avoid a duplicate-NodeId relay collision.",
+                bridge_dir.display()
+            );
+            return Ok(());
+        }
+    };
+
     let target = std::env::var("HERMES_DASHBOARD").unwrap_or_else(|_| DEFAULT_TARGET.to_string());
     let state = Arc::new(BridgeState::load(target.clone()));
 
@@ -366,6 +383,40 @@ impl Drop for FileLock {
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Process-lifetime singleton lock via `flock(LOCK_EX | LOCK_NB)`. The kernel
+/// releases the lock when this process exits OR crashes — so, unlike a pidfile
+/// or the mkdir-mutex `FileLock` above, a dead bridge can never wedge the next
+/// start. Guarantees exactly one bridge per machine: two instances sharing the
+/// persistent `secret` register the SAME iroh NodeId, and the relay then drops
+/// delivery ("Another endpoint connected with the same endpoint id"). A Hermes
+/// gateway `--replace` restart that orphans the old bridge used to trip this.
+struct SingletonLock {
+    _file: std::fs::File,
+}
+
+impl SingletonLock {
+    /// `Some` if we took the lock; `None` if another live instance holds it.
+    fn acquire(path: &Path) -> Option<SingletonLock> {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(path)
+            .ok()?;
+        restrict_file(path);
+        // Non-blocking exclusive lock; rc != 0 (EWOULDBLOCK) ⇒ someone holds it.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return None;
+        }
+        // Stamp our pid in for humans debugging `cat bridge.lock`.
+        let _ = file.set_len(0);
+        let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+        Some(SingletonLock { _file: file })
+    }
 }
 
 /// Stable bridge identity: persist the secret key so the NodeId/ticket survives

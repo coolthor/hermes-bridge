@@ -18,3 +18,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rand = "0.8"
+libc = "0.2"

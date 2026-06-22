@@ -1090,6 +1090,7 @@ dependencies = [
  "image",
  "iroh",
  "iroh-tickets",
+ "libc",
  "n0-error",
  "qrcode",
  "rand 0.8.6",
