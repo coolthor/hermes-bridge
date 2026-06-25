@@ -123,13 +123,25 @@ current_port() {
 }
 
 current_token() {
-  # Prefer our own inherited env: when the AGENT (running inside the dashboard
-  # process) invokes this skill, the token is already in the environment — no
-  # cross-process read needed (the agent's shell sandbox may block `ps eww` from
-  # reading another process's env, which silently yields an empty token).
+  # 1) Prefer our own inherited env: when the AGENT (running inside the dashboard
+  #    process) invokes this skill, the token is already in the environment — no
+  #    cross-process read needed.
   [ -n "${HERMES_DASHBOARD_SESSION_TOKEN:-}" ] && { printf '%s' "$HERMES_DASHBOARD_SESSION_TOKEN"; return 0; }
-  local dpid; dpid="$(dashboard_pid)"; [ -n "$dpid" ] || return 1
-  ps eww "$dpid" 2>/dev/null | tr ' ' '\n' | grep '^HERMES_DASHBOARD_SESSION_TOKEN=' | cut -d= -f2
+  local dpid; dpid="$(dashboard_pid)"
+  # 2) Read it out of the dashboard process env.
+  if [ -n "$dpid" ]; then
+    local t; t="$(ps eww "$dpid" 2>/dev/null | tr ' ' '\n' | grep '^HERMES_DASHBOARD_SESSION_TOKEN=' | cut -d= -f2)"
+    [ -n "$t" ] && { printf '%s' "$t"; return 0; }
+  fi
+  # 3) The agent's shell sandbox often BLOCKS `ps eww` from reading another
+  #    process's env, which silently yields an empty token — the device then
+  #    pairs ✓ but gets token=none and the ws is dropped ("network connection
+  #    lost"). Fall back to scraping the same token the dashboard injects into
+  #    its served index.html.
+  local port="${1:-${PORT:-}}"
+  [ -n "$port" ] && curl -s -m3 "http://127.0.0.1:$port/" 2>/dev/null \
+    | grep -o 'window.__HERMES_SESSION_TOKEN__="[^"]*"' | head -1 \
+    | sed 's/.*="//; s/"$//'
 }
 
 start_bridge() {
@@ -143,7 +155,7 @@ PORT="$(current_port)" || {
   echo "  Open Hermes Desktop, OR (no Desktop?) run:  hermes dashboard"
   exit 1
 }
-TOKEN="$(current_token)"
+TOKEN="$(current_token "$PORT")"
 echo "→ dashboard at 127.0.0.1:$PORT  (token ${TOKEN:0:6}...)"
 start_bridge "$PORT" "$TOKEN"
 

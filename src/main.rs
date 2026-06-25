@@ -563,7 +563,6 @@ impl ProtocolHandler for Proxy {
 /// `window.__HERMES_SESSION_TOKEN__="..."` from its served index.html.
 /// Returns None if the dashboard is unreachable or not token-gated.
 async fn fetch_session_token(target: &str) -> Option<String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     // Prefer an explicitly-provided token (the Hermes Desktop backend serves no
     // scrapeable index.html — its SPA lives in Electron, so GET / 404s).
     if let Ok(t) = std::env::var("HERMES_SESSION_TOKEN") {
@@ -571,6 +570,28 @@ async fn fetch_session_token(target: &str) -> Option<String> {
             return Some(t);
         }
     }
+    // The dashboard can be mid-restart / not-yet-listening at the moment a device
+    // PAIRs — a tester hit exactly this (paired ✓ but token=none → ws dropped with
+    // "network connection lost"). A single scrape attempt then hands the app an
+    // empty token. Retry a few times so a transient miss self-heals within the
+    // PAIR round-trip instead of bouncing the device off until its next reconnect.
+    for attempt in 0..6u32 {
+        if let Some(tok) = scrape_session_token(target).await {
+            if !tok.is_empty() {
+                return Some(tok);
+            }
+        }
+        if attempt < 5 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+    None
+}
+
+/// One scrape of `window.__HERMES_SESSION_TOKEN__="..."` from the dashboard's
+/// served index.html. None on connect failure or a missing marker.
+async fn scrape_session_token(target: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut tcp = tokio::net::TcpStream::connect(target).await.ok()?;
     tcp.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .await
